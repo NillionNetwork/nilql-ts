@@ -181,6 +181,37 @@ describe("methods of cryptographic key classes", () => {
     expect(decrypted).toEqual(plaintext);
   });
 
+  test("generate, dump, JSONify, and load secret key for redundancy operation with multiple nodes", async () => {
+    const cluster = { nodes: [{}, {}, {}] };
+    const secretKey = await nilql.SecretKey.generate(cluster, {
+      redundancy: true,
+    });
+
+    const secretKeyObject = JSON.parse(JSON.stringify(secretKey.dump()));
+    const secretKeyLoaded = nilql.SecretKey.load(secretKeyObject);
+
+    const plaintext = BigInt(123);
+    const ciphertext = await nilql.encrypt(secretKey, plaintext);
+    const decrypted = await nilql.decrypt(secretKeyLoaded, ciphertext);
+    expect(decrypted).toEqual(plaintext);
+  });
+
+  test("generate, dump, JSONify, and load cluster key for redundancy operation with multiple nodes", async () => {
+    const cluster = { nodes: [{}, {}, {}] };
+    const clusterKey = await nilql.ClusterKey.generate(cluster, {
+      redundancy: true,
+    });
+
+    const clusterKeyObject = JSON.parse(JSON.stringify(clusterKey.dump()));
+    const clusterKeyLoaded = nilql.ClusterKey.load(clusterKeyObject);
+    expect(clusterKeyLoaded instanceof nilql.ClusterKey).toEqual(true);
+
+    const plaintext = BigInt(123);
+    const ciphertext = await nilql.encrypt(clusterKey, plaintext);
+    const decrypted = await nilql.decrypt(clusterKeyLoaded, ciphertext);
+    expect(decrypted).toEqual(plaintext);
+  });
+
   test("generate key from seed for store operation with single node", async () => {
     const secretKeyFromSeed = await nilql.SecretKey.generate(
       { nodes: [{}] },
@@ -275,6 +306,25 @@ describe("methods of cryptographic key classes", () => {
       "L8RiHNq2EUgt/fDOoUw9QK2NISeUkAkhxHHIPoHPZ84=",
     );
   });
+});
+
+test("generate key from seed for redundancy operation with multiple nodes", async () => {
+  const secretKeyFromSeed = await nilql.SecretKey.generate(
+    { nodes: [{}, {}, {}] },
+    { redundancy: true },
+    seed,
+  );
+  expect(
+    await toHashBase64(secretKeyFromSeed.material as number[]),
+  ).toStrictEqual("L8RiHNq2EUgt/fDOoUw9QK2NISeUkAkhxHHIPoHPZ84=");
+
+  const secretKey = await nilql.SecretKey.generate(
+    { nodes: [{}, {}, {}] },
+    { redundancy: true },
+  );
+  expect(await toHashBase64(secretKey.material as number[])).not.toEqual(
+    "L8RiHNq2EUgt/fDOoUw9QK2NISeUkAkhxHHIPoHPZ84=",
+  );
 });
 
 /**
@@ -620,6 +670,100 @@ describe("encryption and decryption functions", () => {
     );
     expect(decryptedFromBigInt).toEqual(plaintextBigInt);
   });
+
+  test("encryption and decryption for reduncancy operation with multiple nodes", async () => {
+    const secretKey = await nilql.SecretKey.generate(
+      { nodes: [{}, {}, {}] },
+      { redundancy: true },
+    );
+
+    const plaintextNumber = 123;
+    const ciphertextFromNumber = await nilql.encrypt(
+      secretKey,
+      plaintextNumber,
+    );
+    const decryptedFromNumber = await nilql.decrypt(
+      secretKey,
+      ciphertextFromNumber,
+    );
+    expect(decryptedFromNumber).toEqual(BigInt(plaintextNumber));
+
+    const plaintextBigInt = BigInt(123);
+    const ciphertextFromBigInt = await nilql.encrypt(
+      secretKey,
+      plaintextBigInt,
+    );
+    const decryptedFromBigInt = await nilql.decrypt(
+      secretKey,
+      ciphertextFromBigInt,
+    );
+    expect(decryptedFromBigInt).toEqual(plaintextBigInt);
+  });
+
+  test("encryption and decryption for reduncancy operation with multiple nodes one failure", async () => {
+    const secretKey = await nilql.SecretKey.generate(
+      { nodes: [{}, {}, {}] },
+      { redundancy: true },
+    );
+
+    const plaintextNumber = 123;
+    const ciphertextFromNumber = await nilql.encrypt(
+      secretKey,
+      plaintextNumber,
+    );
+    const decryptedFromNumber = await nilql.decrypt(
+      secretKey,
+      ciphertextFromNumber,
+    );
+    expect(decryptedFromNumber).toEqual(BigInt(plaintextNumber));
+
+    const plaintextBigInt = BigInt(123);
+    const ciphertextFromBigInt = await nilql.encrypt(
+      secretKey,
+      plaintextBigInt,
+    );
+    const decryptedFromBigInt = await nilql.decrypt(
+      secretKey,
+      ciphertextFromBigInt,
+    );
+    expect(decryptedFromBigInt).toEqual(plaintextBigInt);
+  });
+
+  test("encryption and decryption for redundancy operation with multiple nodes and one failure", async () => {
+    const secretKey = await nilql.SecretKey.generate(
+      { nodes: [{}, {}, {}] }, // 3 nodes
+      { redundancy: true },
+    );
+
+    const plaintextNumber = 123;
+    const ciphertextFromNumber = await nilql.encrypt(
+      secretKey,
+      plaintextNumber,
+    );
+
+    // Simulate a node failure by removing one share
+    const partialCiphertext = ciphertextFromNumber.slice(1); // Removing the first share
+    const decryptedFromNumber = await nilql.decrypt(
+      secretKey,
+      partialCiphertext,
+    );
+    expect(decryptedFromNumber).toEqual(BigInt(plaintextNumber));
+
+    const plaintextBigInt = BigInt(123);
+    const ciphertextFromBigInt = await nilql.encrypt(
+      secretKey,
+      plaintextBigInt,
+    );
+
+    // Simulate failure again
+    const partialCiphertextBigInt = ciphertextFromBigInt.slice(1);
+
+    const decryptedFromBigInt = await nilql.decrypt(
+      secretKey,
+      partialCiphertextBigInt,
+    );
+    expect(decryptedFromBigInt).toEqual(plaintextBigInt);
+  });
 });
 
 /**
@@ -642,6 +786,21 @@ describe("portable representation of ciphertexts", () => {
     const clusterKey = await nilql.ClusterKey.generate(cluster, { sum: true });
     const plaintext = BigInt(123);
     const ciphertext = [456, 246, 4294967296 + 15 - 123 - 456];
+    const decrypted = await nilql.decrypt(clusterKey, ciphertext);
+    expect(decrypted).toEqual(plaintext);
+  });
+
+  test("secret share representation for redundancy operation with multiple nodes", async () => {
+    const cluster = { nodes: [{}, {}, {}] };
+    const clusterKey = await nilql.ClusterKey.generate(cluster, {
+      redundancy: true,
+    });
+    const plaintext = BigInt(123);
+    const ciphertext = [
+      [1, 1382717699],
+      [2, 2765435275],
+      [3, 4148152851],
+    ];
     const decrypted = await nilql.decrypt(clusterKey, ciphertext);
     expect(decrypted).toEqual(plaintext);
   });
@@ -903,6 +1062,34 @@ describe("end-to-end workflows involving secure computation", () => {
       (b0 + b1 + b2) % (2 ** 32 + 15),
       (c0 + c1 + c2) % (2 ** 32 + 15),
     ];
+    const decrypted = await nilql.decrypt(secretKey, [a3, b3, c3]);
+    expect(BigInt(decrypted as bigint)).toEqual(BigInt(123 + 456 + 789));
+  });
+});
+
+/**
+ * Tests consisting of end-to-end workflows involving secure computation.
+ */
+describe("end-to-end workflows involving secure computation", () => {
+  test("end-to-end workflow for secure summation with a multi-node cluster and redundancy", async () => {
+    const secretKey = await nilql.ClusterKey.generate(
+      { nodes: [{}, {}, {}] },
+      { redundancy: true },
+    );
+    const [a0, b0, c0] = (await nilql.encrypt(secretKey, 123)) as Array<
+      [number, number]
+    >;
+    const [a1, b1, c1] = (await nilql.encrypt(secretKey, 456)) as Array<
+      [number, number]
+    >;
+    const [a2, b2, c2] = (await nilql.encrypt(secretKey, 789)) as Array<
+      [number, number]
+    >;
+
+    const [a3, b3, c3] = nilql.shamirsAdd(
+      nilql.shamirsAdd([a0, b0, c0], [a1, b1, c1]),
+      [a2, b2, c2],
+    );
     const decrypted = await nilql.decrypt(secretKey, [a3, b3, c3]);
     expect(BigInt(decrypted as bigint)).toEqual(BigInt(123 + 456 + 789));
   });

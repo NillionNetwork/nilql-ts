@@ -6,6 +6,8 @@ import { hkdf } from "node:crypto";
 import * as bcu from "bigint-crypto-utils";
 import sodium from "libsodium-wrappers-sumo";
 import * as paillierBigint from "paillier-bigint";
+// import * as interpolatingPolynomial from "interpolating-polynomial";
+// import linearInterpolator from "linear-interpolator";
 
 /**
  * Minimum plaintext 32-bit signed integer value that can be encrypted.
@@ -26,6 +28,11 @@ const _SECRET_SHARED_SIGNED_INTEGER_MODULUS = 2n ** 32n + 15n;
  * Maximum length of plaintext string values that can be encrypted.
  */
 const _PLAINTEXT_STRING_BUFFER_LEN_MAX = 4096;
+
+/**
+ * Minimum number of shares required to reconstruct a Shamir secret.
+ */
+const _SHAMIRS_MINIMUM_SHARES_FOR_RECONSTRUCTION = 2;
 
 /**
  * Mathematically standard modulus operator.
@@ -138,6 +145,98 @@ async function _randomInteger(
 }
 
 /**
+ * Evaluates polynomial (coefficient tuple) at x.
+ */
+function _shamirsEval(poly: bigint[], x: bigint, prime: bigint): bigint {
+  let accum = BigInt(0);
+  for (let i = poly.length - 1; i >= 0; i--) {
+    accum = (_mod(accum * x, prime) + poly[i]) % prime;
+  }
+  return accum;
+}
+
+/**
+ * Generates a random Shamir pool for a given secret and returns share points.
+ */
+async function _shamirsShares(
+  secret: bigint,
+  totalShares: number,
+  minimumShares: number,
+  prime: bigint,
+): Promise<[bigint, bigint][]> {
+  if (minimumShares > totalShares) {
+    throw new Error("Minimum shares required must be less than total shares.");
+  }
+
+  // Generate polynomial coefficients, ensuring they are within the correct range.
+  const poly: bigint[] = [secret];
+  for (let i = 1; i < minimumShares; i++) {
+    poly.push(await _randomInteger(1n, prime - 1n)); // Use a proper `bigint` random generator
+  }
+
+  // Generate the shares.
+  const points: [bigint, bigint][] = [];
+  for (let i = 1; i <= totalShares; i++) {
+    const x = BigInt(i);
+    const y = _shamirsEval(poly, x, prime);
+    points.push([x, y]);
+  }
+  return points;
+}
+
+function _shamirsRecover(shares: bigint[][], prime: bigint): bigint {
+  if (shares.length < _SHAMIRS_MINIMUM_SHARES_FOR_RECONSTRUCTION) {
+    throw new Error(
+      `At least ${_SHAMIRS_MINIMUM_SHARES_FOR_RECONSTRUCTION} shares are required.`,
+    );
+  }
+
+  let secret = 0n;
+
+  for (let i = 0; i < shares.length; i++) {
+    let num = 1n;
+    let denom = 1n;
+
+    for (let j = 0; j < shares.length; j++) {
+      if (i !== j) {
+        num = _mod(num * -shares[j][0], prime);
+        denom = _mod(denom * (shares[i][0] - shares[j][0]), prime);
+      }
+    }
+
+    const invDenom = bcu.modInv(denom, prime); // Modular inverse
+    secret = _mod(secret + shares[i][1] * num * invDenom, prime);
+  }
+
+  return secret;
+}
+
+function shamirsAdd(
+  shares1: [number, number][],
+  shares2: [number, number][],
+): [number, number][] {
+  if (shares1.length !== shares2.length) {
+    throw new Error("Shares sets must have the same length.");
+  }
+
+  return shares1.map(([x1, y1], index) => {
+    const [x2, y2] = shares2[index];
+    if (x1 !== x2) {
+      throw new Error("Mismatched x-values in shares.");
+    }
+    return [
+      x1,
+      Number(
+        _mod(
+          BigInt(y1) + BigInt(y2),
+          BigInt(_SECRET_SHARED_SIGNED_INTEGER_MODULUS),
+        ),
+      ),
+    ];
+  });
+}
+
+/**
  * Encode a byte array object as a Base64 string (for compatibility with JSON).
  */
 function _pack(b: Uint8Array): string {
@@ -210,6 +309,7 @@ interface Operations {
   store?: boolean;
   match?: boolean;
   sum?: boolean;
+  redundancy?: boolean;
 }
 
 /**
@@ -229,7 +329,10 @@ class SecretKey {
 
     if (
       Object.keys(operations).length !== 1 ||
-      (!operations.store && !operations.match && !operations.sum)
+      (!operations.store &&
+        !operations.match &&
+        !operations.sum &&
+        !operations.redundancy)
     ) {
       throw new TypeError(
         "operation specification must enable exactly one operation",
@@ -302,6 +405,27 @@ class SecretKey {
             ),
           );
         }
+      }
+    }
+
+    if (secretKey.operations.redundancy) {
+      if (secretKey.cluster.nodes.length === 1) {
+        throw Error("redundancy is not supported for single-node clusters");
+      }
+      // Distinct multiplicative mask for each additive share.
+      secretKey.material = [];
+      for (let i = 0n; i < secretKey.cluster.nodes.length; i++) {
+        const indexBytes = Buffer.alloc(8);
+        indexBytes.writeBigInt64LE(i, 0);
+        (secretKey.material as Array<number>).push(
+          Number(
+            await _randomInteger(
+              1n,
+              _SECRET_SHARED_SIGNED_INTEGER_MODULUS - 1n,
+              await _randomBytes(64, seedBytes, indexBytes),
+            ),
+          ),
+        );
       }
     }
     return secretKey;
@@ -564,7 +688,7 @@ class PublicKey {
 async function encrypt(
   key: PublicKey | SecretKey,
   plaintext: number | bigint | string | Uint8Array,
-): Promise<string | string[] | number[]> {
+): Promise<string | string[] | number[] | number[][]> {
   await sodium.ready;
 
   const error = new Error(
@@ -725,6 +849,46 @@ async function encrypt(
     return shares.map(Number);
   }
 
+  // Encrypt an integer plaintext in a summation-compatible way.
+  if (key.operations.redundancy) {
+    // Only 32-bit signed integer plaintexts are supported.
+    if (
+      !(typeof plaintext === "number" && Number.isInteger(plaintext)) &&
+      !(typeof plaintext === "bigint")
+    ) {
+      throw new TypeError(
+        "plaintext to encrypt for sum operation must be integer number or bigint",
+      );
+    }
+
+    if (key.cluster.nodes.length === 1) {
+      throw new TypeError(
+        "redundancy is not supported for single-node clusters",
+      );
+    }
+
+    let shares = await _shamirsShares(
+      BigInt(plaintext),
+      key.cluster.nodes.length,
+      _SHAMIRS_MINIMUM_SHARES_FOR_RECONSTRUCTION,
+      _SECRET_SHARED_SIGNED_INTEGER_MODULUS,
+    );
+
+    // For multiple-node clusters, additive secret sharing is used.
+    const secretKey = key as SecretKey;
+    const masks: bigint[] =
+      "material" in secretKey
+        ? (secretKey.material as number[]).map(BigInt)
+        : secretKey.cluster.nodes.map((_) => 1n);
+
+    shares = shares.map(([x, y], i) => [
+      x,
+      _mod(y * masks[i], _SECRET_SHARED_SIGNED_INTEGER_MODULUS),
+    ]);
+
+    return shares.map(([x, y]) => [Number(x), Number(y)]) as [number, number][];
+  }
+
   // The below should not occur unless the key's cluster or operations
   // information is malformed/missing or the plaintext is unsupported.
   throw error;
@@ -736,7 +900,7 @@ async function encrypt(
  */
 async function decrypt(
   secretKey: SecretKey,
-  ciphertext: string | string[] | number[],
+  ciphertext: string | string[] | number[] | number[][],
 ): Promise<bigint | string | Uint8Array> {
   await sodium.ready;
 
@@ -755,15 +919,25 @@ async function decrypt(
   } else {
     if (
       !Array.isArray(ciphertext) ||
-      (!ciphertext.every((c) => typeof c === "number") &&
-        !ciphertext.every((c) => typeof c === "string"))
+      !ciphertext.every(
+        (c) =>
+          typeof c === "number" ||
+          typeof c === "string" ||
+          (Array.isArray(c) &&
+            c.length === 2 &&
+            typeof c[0] === "number" &&
+            typeof c[1] === "number"),
+      )
     ) {
       throw new TypeError(
         "secret key requires a valid ciphertext from a multiple-node cluster",
       );
     }
 
-    if (secretKey.cluster.nodes.length !== ciphertext.length) {
+    if (
+      secretKey.cluster.nodes.length !== ciphertext.length &&
+      !secretKey.operations.redundancy
+    ) {
       throw new TypeError(
         "secret key and ciphertext must have the same associated cluster size",
       );
@@ -843,6 +1017,48 @@ async function decrypt(
         _SECRET_SHARED_SIGNED_INTEGER_MODULUS,
       );
     }
+
+    // Field elements in the "upper half" of the field represent negative
+    // integers.
+    if (plaintext > _PLAINTEXT_SIGNED_INTEGER_MAX) {
+      plaintext -= _SECRET_SHARED_SIGNED_INTEGER_MODULUS;
+    }
+
+    return plaintext;
+  }
+
+  // Decrypt a value that was encrypted in a summation-compatible way.
+  if (secretKey.operations.redundancy) {
+    if (secretKey.cluster.nodes.length === 1) {
+      throw new TypeError(
+        "redundancy is not supported for single-node clusters",
+      );
+    }
+
+    // For multiple-node clusters, additive secret sharing is used.
+    const inverseMasks: bigint[] =
+      "material" in secretKey
+        ? (secretKey.material as number[]).map((mask) => {
+            return bcu.modPow(
+              BigInt(mask),
+              _SECRET_SHARED_SIGNED_INTEGER_MODULUS - 2n,
+              _SECRET_SHARED_SIGNED_INTEGER_MODULUS,
+            );
+          })
+        : secretKey.cluster.nodes.map((_) => 1n);
+    const shares: [bigint, bigint][] = (ciphertext as [number, number][]).map(
+      ([x, y], i) => [
+        BigInt(x),
+        _mod(
+          BigInt(y) * inverseMasks[x - 1],
+          _SECRET_SHARED_SIGNED_INTEGER_MODULUS,
+        ),
+      ],
+    );
+    let plaintext: bigint = _shamirsRecover(
+      shares,
+      _SECRET_SHARED_SIGNED_INTEGER_MODULUS,
+    );
 
     // Field elements in the "upper half" of the field represent negative
     // integers.
@@ -1086,6 +1302,7 @@ export const nilql = {
   PublicKey,
   encrypt,
   decrypt,
+  shamirsAdd,
   allot,
   unify,
 } as const;
