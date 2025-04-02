@@ -560,6 +560,34 @@ describe("encryption and decryption functions", () => {
       expect(decryptedFromBinary).toEqual(plaintextBinary);
     });
 
+    test(`encryption and decryption for large store operation (${cluster.nodes.length})`, async () => {
+      const secretKey = await nilql.SecretKey.generate(cluster, {
+        store: true,
+      });
+
+      const plaintextString = `
+      Bart Simpson is a fictional character in the American animated television series The Simpsons
+      who is part of the Simpson family. Described as one of the 100 most important people of the
+      20th century by Time, Bart was created and designed by Matt Groening in James L. Brooks's
+      office. Bart, alongside the rest of the family, debuted in the short 'Good Night' on The
+      Tracey Ullman Show on April 19, 1987. Two years later, the family received their own series,
+      which premiered on Fox on December 17, 1989. Born on April Fools' Day according to Groening,
+      Bart is ten years old; he is the eldest child and only son of Homer and Marge Simpson, and
+      has two sisters, Lisa and Maggie. Voiced by Nancy Cartwright (pictured), Bart is known for
+      his mischievousness, rebelliousness, and disrespect for authority, as well as his prank calls
+      to Moe, chalkboard gags in the opening sequence, and catchphrases. Bart is considered an
+      iconic fictional television character of the 1990s and has been called an American cultural icon.`;
+      const ciphertextFromString = await nilql.encrypt(
+        secretKey,
+        plaintextString,
+      );
+      const decryptedFromString = (await nilql.decrypt(
+        secretKey,
+        ciphertextFromString,
+      )) as string;
+      expect(decryptedFromString).toEqual(plaintextString);
+    });
+
     test(`encryption of number for match operation (${cluster.nodes.length})`, async () => {
       const secretKey = await nilql.SecretKey.generate(cluster, {
         match: true,

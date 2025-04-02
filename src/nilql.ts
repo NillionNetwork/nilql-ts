@@ -28,6 +28,11 @@ const _SECRET_SHARED_SIGNED_INTEGER_MODULUS = 2n ** 32n + 15n;
 const _PLAINTEXT_STRING_BUFFER_LEN_MAX = 4096;
 
 /**
+ * Length of random number generator seed.
+ */
+const _SEED_LEN = 64;
+
+/**
  * Mathematically standard modulus operator.
  */
 function _mod(n: bigint, m: bigint): bigint {
@@ -789,9 +794,19 @@ async function encrypt(
     const shares: Uint8Array[] = [];
     let aggregate = Buffer.alloc(buffer.length, 0);
     for (let i = 0; i < key.cluster.nodes.length - 1; i++) {
-      const mask = Buffer.from(sodium.randombytes_buf(buffer.length));
+      let mask: Buffer<ArrayBufferLike>;
+      // If the plaintext length is more than the length of the seed, use the
+      // seed to generate the mask, otherwise, generate it directly.
+      if (buffer.length > _SEED_LEN) {
+        const seed = Buffer.from(sodium.randombytes_buf(_SEED_LEN));
+        const rand = await _randomBytes(buffer.length, seed);
+        mask = Buffer.from(rand);
+        shares.push(optionalEncrypt(seed));
+      } else {
+        mask = Buffer.from(sodium.randombytes_buf(buffer.length));
+        shares.push(optionalEncrypt(mask));
+      }
       aggregate = _xor(aggregate, mask);
-      shares.push(optionalEncrypt(mask));
     }
     shares.push(optionalEncrypt(_xor(aggregate, buffer)));
     return shares.map(_pack);
@@ -977,10 +992,23 @@ async function decrypt(
 
     // For multiple-node clusters, the plaintext is secret-shared using XOR
     // (with each share symmetrically encrypted in the case of a secret key).
-    const shares = (ciphertext as string[]).map(_unpack).map(optionalDecrypt);
+    let shares = (ciphertext as string[]).map(_unpack).map(optionalDecrypt);
+
+    // We bring the true share first and leave the seeds last, or if everything
+    // is a share, the following lines don't do anything.
+    const lens = shares.map((share) => share.length);
+    const indices = lens.map((len, i) => i).sort((a, b) => lens[b] - lens[a]);
+    shares = indices.map((i) => shares[i]);
+
     let buffer = Buffer.from(shares[0]);
     for (let i = 1; i < shares.length; i++) {
-      buffer = Buffer.from(_xor(buffer, Buffer.from(shares[i])));
+      let share = shares[i];
+      // If the share_ is not of same length as the first share, this means
+      // that it is a seed. So generate share from the seed.
+      if (buffer.length !== share.length) {
+        share = await _randomBytes(buffer.length, share);
+      }
+      buffer = Buffer.from(_xor(buffer, Buffer.from(share)));
     }
     return _decode(buffer);
   }
